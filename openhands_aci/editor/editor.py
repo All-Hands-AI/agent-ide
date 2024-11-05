@@ -1,3 +1,5 @@
+import argparse
+import json
 from collections import defaultdict
 from pathlib import Path
 from typing import Literal, get_args
@@ -8,6 +10,7 @@ from .exceptions import (
     EditorToolParameterMissingError,
     ToolError,
 )
+from .navigator import SymbolNavigator
 from .results import CLIResult, ToolResult, maybe_truncate
 from .shell import run_shell_cmd
 
@@ -17,8 +20,8 @@ Command = Literal[
     'str_replace',
     'insert',
     'undo_edit',
-    # 'jump_to_definition', TODO:
-    # 'find_references' TODO:
+    'jump_to_definition',
+    'find_references',
 ]
 
 
@@ -36,23 +39,27 @@ class OHEditor:
 
     TOOL_NAME = 'oh_editor'
 
-    def __init__(self) -> None:
+    def __init__(self, workspace='./') -> None:
         self._file_history: dict[Path, list[str]] = defaultdict(list)
+        self.symbol_navigator = SymbolNavigator(root=workspace)
 
     def __call__(
         self,
         *,
         command: Command,
-        path: str,
+        path: str | None = None,
         file_text: str | None = None,
         view_range: list[int] | None = None,
         old_str: str | None = None,
         new_str: str | None = None,
         insert_line: int | None = None,
+        symbol_name: str | None = None,
         **kwargs,
     ) -> ToolResult | CLIResult:
-        _path = Path(path)
-        self.validate_path(command, _path)
+        if path is not None:
+            _path = Path(path)
+            self.validate_path(command, _path)
+
         if command == 'view':
             return self.view(_path, view_range)
         elif command == 'create':
@@ -73,6 +80,14 @@ class OHEditor:
             return self.insert(_path, insert_line, new_str)
         elif command == 'undo_edit':
             return self.undo_edit(_path)
+        elif command == 'jump_to_definition':
+            if not symbol_name:
+                raise EditorToolParameterMissingError(command, 'symbol_name')
+            return self.jump_to_definition(_path if path else None, symbol_name)
+        elif command == 'find_references':
+            if not symbol_name:
+                raise EditorToolParameterMissingError(command, 'symbol_name')
+            return self.find_references(symbol_name)
 
         raise ToolError(
             f'Unrecognized command {command}. The allowed commands for the {self.TOOL_NAME} tool are: {", ".join(get_args(Command))}'
@@ -191,15 +206,6 @@ class OHEditor:
             file_content = '\n'.join(file_content_lines[start_line - 1 : end_line])
         return CLIResult(output=self._make_output(file_content, str(path), start_line))
 
-    def write_file(self, path: Path, file_text: str) -> None:
-        """
-        Write the content of a file to a given path; raise a ToolError if an error occurs.
-        """
-        try:
-            path.write_text(file_text)
-        except Exception as e:
-            raise ToolError(f'Ran into {e} while trying to write to {path}') from None
-
     def insert(self, path: Path, insert_line: int, new_str: str) -> CLIResult:
         """
         Implement the insert command, which inserts new_str at the specified line in the file content.
@@ -252,6 +258,43 @@ class OHEditor:
         success_message += 'Review the changes and make sure they are as expected (correct indentation, no duplicate lines, etc). Edit the file again if necessary.'
         return CLIResult(output=success_message)
 
+    def undo_edit(self, path: Path) -> CLIResult:
+        """
+        Implement the undo_edit command.
+        """
+        if not self._file_history[path] or len(self._file_history[path]) <= 1:
+            raise ToolError(f'No edit history found for {path}.')
+
+        self._file_history[path].pop()
+        old_text = self._file_history[path][-1]
+        self.write_file(path, old_text)
+
+        return CLIResult(
+            output=f'Last edit to {path} undone successfully. {self._make_output(old_text, str(path))}'
+        )
+
+    def jump_to_definition(self, path: Path | None, symbol_name: str) -> ToolResult:
+        """
+        Implement the jump_to_definition command.
+        """
+        if path is None:
+            return CLIResult(
+                output=self.symbol_navigator.get_definitions_tree(symbol_name)
+            )
+        else:
+            rel_path_str = str(path.relative_to(self.symbol_navigator.root))
+            return CLIResult(
+                output=self.symbol_navigator.get_definitions_tree(
+                    symbol_name, rel_path_str
+                )
+            )
+
+    def find_references(self, symbol_name: str) -> ToolResult:
+        """
+        Implement the find_references command.
+        """
+        return CLIResult(output=self.symbol_navigator.get_references_tree(symbol_name))
+
     def validate_path(self, command: Command, path: Path) -> None:
         """
         Check that the path/command combination is valid.
@@ -284,6 +327,24 @@ class OHEditor:
                 f'The path {path} is a directory and only the `view` command can be used on directories.',
             )
 
+    def read_file(self, path: Path) -> str:
+        """
+        Read the content of a file from a given path; raise a ToolError if an error occurs.
+        """
+        try:
+            return path.read_text()
+        except Exception as e:
+            raise ToolError(f'Ran into {e} while trying to read {path}') from None
+
+    def write_file(self, path: Path, file_text: str) -> None:
+        """
+        Write the content of a file to a given path; raise a ToolError if an error occurs.
+        """
+        try:
+            path.write_text(file_text)
+        except Exception as e:
+            raise ToolError(f'Ran into {e} while trying to write to {path}') from None
+
     def _populate_file_history_if_having_content_before_edit(self, path: Path) -> None:
         """
         Populate the file history with the current file content.
@@ -293,30 +354,6 @@ class OHEditor:
             return
 
         self._file_history[path].append(self.read_file(path))
-
-    def undo_edit(self, path: Path) -> CLIResult:
-        """
-        Implement the undo_edit command.
-        """
-        if not self._file_history[path] or len(self._file_history[path]) <= 1:
-            raise ToolError(f'No edit history found for {path}.')
-
-        self._file_history[path].pop()
-        old_text = self._file_history[path][-1]
-        self.write_file(path, old_text)
-
-        return CLIResult(
-            output=f'Last edit to {path} undone successfully. {self._make_output(old_text, str(path))}'
-        )
-
-    def read_file(self, path: Path) -> str:
-        """
-        Read the content of a file from a given path; raise a ToolError if an error occurs.
-        """
-        try:
-            return path.read_text()
-        except Exception as e:
-            raise ToolError(f'Ran into {e} while trying to read {path}') from None
 
     def _make_output(
         self,
@@ -343,3 +380,113 @@ class OHEditor:
             + snippet_content
             + '\n'
         )
+
+
+def parse_command_input(cmd_input: str) -> tuple[Command, dict]:
+    """Parse the command input into command name and parameters."""
+    try:
+        cmd_dict = json.loads(cmd_input)
+        command = cmd_dict.pop('command')
+        assert command in get_args(Command)
+        return command, cmd_dict  # type: ignore
+    except json.JSONDecodeError:
+        raise ValueError('Invalid command format. Please provide a valid JSON object.')
+    except KeyError:
+        raise ValueError("Command must include a 'command' field.")
+
+
+def print_help():
+    """Print available commands and their usage."""
+    help_text = """
+Available commands (provide as JSON objects):
+------------------------------------------
+1. View file/directory:
+    {"command": "view", "path": "/absolute/path", "view_range": [start_line, end_line]}
+
+2. Create file:
+    {"command": "create", "path": "/absolute/path", "file_text": "content"}
+
+3. Replace string:
+    {"command": "str_replace", "path": "/absolute/path", "old_str": "old", "new_str": "new"}
+
+4. Insert at line:
+    {"command": "insert", "path": "/absolute/path", "insert_line": number, "new_str": "content"}
+
+5. Undo last edit:
+    {"command": "undo_edit", "path": "/absolute/path"}
+
+6. Jump to definition:
+    {"command": "jump_to_definition", "path": "/absolute/path", "symbol_name": "symbol"}
+
+7. Find references:
+    {"command": "find_references", "symbol_name": "symbol"}
+
+Type 'exit' to quit or 'help' to see this message again.
+"""
+    print(help_text)
+
+
+def main():
+    # Set up argument parser
+    parser = argparse.ArgumentParser(description='OHEditor - File System Editor Tool')
+    parser.add_argument(
+        '--workspace',
+        type=str,
+        default='./',
+        help='Workspace directory path (default: current directory)',
+    )
+
+    # Parse command line arguments
+    args = parser.parse_args()
+
+    # Initialize the editor
+    editor = OHEditor(workspace=args.workspace)
+
+    # Print welcome message and help
+    print(f'OHEditor initialized with workspace: {args.workspace}')
+    print_help()
+
+    # Main command loop
+    while True:
+        try:
+            # Get user input
+            user_input = input("\nEnter command (or 'help'/'exit'): ").strip()
+
+            # Check for exit command
+            if user_input.lower() == 'exit':
+                print('Exiting OHEditor...')
+                break
+
+            # Check for help command
+            if user_input.lower() == 'help':
+                print_help()
+                continue
+
+            # Parse and execute command
+            try:
+                command, params = parse_command_input(user_input)
+                result = editor(command=command, **params)
+                print('\nResult:')
+                print(result.output)
+                if result.error:
+                    print('\nErrors:')
+                    print(result.error)
+
+            except (
+                ValueError,
+                ToolError,
+                EditorToolParameterInvalidError,
+                EditorToolParameterMissingError,
+            ) as e:
+                print(f'\nError: {str(e)}')
+
+        except KeyboardInterrupt:
+            print("\nReceived interrupt signal. Type 'exit' to quit.")
+            continue
+        except Exception as e:
+            print(f'\nUnexpected error: {str(e)}')
+            continue
+
+
+if __name__ == '__main__':
+    main()

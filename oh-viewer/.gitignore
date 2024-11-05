@@ -1,0 +1,5 @@
+# Python
+*.egg-info/
+
+# Build files
+tree-sitter-parsers/
